@@ -1,3 +1,4 @@
+import Collections
 import Foundation
 
 public struct Queue<Item, ItemProgress: ItemProgressProtocol>: QueueProtocol {
@@ -20,6 +21,12 @@ public protocol ActionProtocol {
   static func addItemAction(_ item: Item, _ id: QueueItemId) -> Self
 }
 
+public protocol ItemStateProtocol {
+  var isExecuting: Bool { get }
+  mutating func setExecuting()
+  static func initialState() -> Self
+}
+
 public protocol ItemHandleProtocol {
   associatedtype ItemProgress: ItemProgressProtocol
   var cancel: () -> Void { get }
@@ -34,29 +41,47 @@ public protocol ItemProgressProtocol {
 
 public extension Queue {
   struct State {
-    public var enqueuedItems: [ItemAndId]
-    public var executingItems: [ItemAndId]
+    public var items: OrderedSet<ItemAndState>
     public var concurrentExecutions: Int
     public var sendItemProgress: SendItemProgress
     public var isStarted = false
 
     public init(
-      items: [ItemAndId] = [],
+      items: OrderedSet<ItemAndState> = .init(),
       concurrentExecutions: Int = 1
     ) {
-      enqueuedItems = items
-      executingItems = []
+      self.items = items
       self.concurrentExecutions = concurrentExecutions
       sendItemProgress = SendItemProgress()
     }
 
-    public struct ItemAndId: Equatable {
+    public struct ItemAndState: Equatable, Hashable {
       public let id: QueueItemId
       public let item: Item
+      public var state: ItemState
 
       public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.id == rhs.id
       }
+      
+      public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+      }
+    }
+  }
+  
+  enum ItemState: ItemStateProtocol, Equatable {
+    case initial
+    case executing
+    
+    public var isExecuting: Bool { self == .executing }
+    
+    public mutating func setExecuting() {
+      self = .executing
+    }
+    
+    public static func initialState() -> Queue<Item, ItemProgress>.ItemState {
+      .initial
     }
   }
 
@@ -65,9 +90,9 @@ public extension Queue {
     case stopQueue
     case addRequest(Item, QueueItemId)
     case onWillAdd(Item, QueueItemId)
-    case onDidAdd(State.ItemAndId)
+    case onDidAdd(State.ItemAndState)
     case onNextItemsShouldBeExecuted
-    case executeItem(State.ItemAndId)
+    case executeItem(State.ItemAndState)
     case onItemProgress(Item, QueueItemId, ItemProgress)
     case onItemTaskFinished(Item, QueueItemId)
     case onItemTerminationConfirmed(QueueItemId)
@@ -94,25 +119,43 @@ public extension Queue {
         return .value(.onWillAdd(item, id))
 
       case let .onWillAdd(item, id):
-        let itemAndId = State.ItemAndId(id: id, item: item)
-        state.enqueuedItems.append(itemAndId)
-        return .value(.onDidAdd(itemAndId))
+        let itemAndState = State.ItemAndState(id: id, item: item, state: .initialState())
+        state.items.append(itemAndState)
+        return .value(.onDidAdd(itemAndState))
 
       case .onDidAdd:
         return .value(.onNextItemsShouldBeExecuted)
 
       case .onNextItemsShouldBeExecuted:
         guard state.isStarted else { return .none }
-        let itemsToExecute = Array(
-          state.enqueuedItems
-            .prefix(state.concurrentExecutions - state.executingItems.count)
+        
+        let executingItemsCount = state.items
+          .filter { $0.state.isExecuting }
+          .count
+          
+        let itemIdxsToExecute = Array(
+          state.items
+            .lazy
+            .filter { !$0.state.isExecuting }
+            .compactMap { [state] in state.items.firstIndex(of: $0) }
+            .prefix(state.concurrentExecutions - executingItemsCount)
         )
-        guard !itemsToExecute.isEmpty else { return .none }
-        state.enqueuedItems.removeFirst(itemsToExecute.count)
-        state.executingItems.append(contentsOf: itemsToExecute)
-        return .run { send in
-          for itemAndId in itemsToExecute {
-            send(.executeItem(itemAndId))
+        guard !itemIdxsToExecute.isEmpty else { return .none }
+        
+        var itemsToExecute = [State.ItemAndState]()
+        
+        for idx in itemIdxsToExecute {
+          var executingItem = state.items[idx]
+          executingItem.state.setExecuting()
+          state.items.update(executingItem, at: idx)
+          itemsToExecute.append(
+            .init(id: executingItem.id, item: executingItem.item, state: executingItem.state)
+          )
+        }
+        
+        return .run { [itemsToExecute] send in
+          for itemAndState in itemsToExecute {
+            send(.executeItem(itemAndState))
           }
         }
 
@@ -134,7 +177,7 @@ public extension Queue {
         return .none
 
       case let .onItemTerminationConfirmed(id):
-        state.executingItems.removeAll(where: { $0.id == id })
+        state.items.removeAll(where: { $0.id == id })
         return .value(.onNextItemsShouldBeExecuted)
 
       case .startQueue:

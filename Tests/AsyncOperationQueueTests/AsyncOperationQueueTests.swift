@@ -28,7 +28,7 @@ final class AsyncOperationQueueTests: XCTestCase {
 
     _ = queue.start()
 
-    let handlesAndItems = (0 ..< 1000)
+    let handlesAndItems = (0 ..< 1_000)
       .reduce(into: [(QueueType.ItemHandle, Int)]()) { partialResult, item in
         guard let handle = queue.add(item: item, id: QueueItemId()) else {
           XCTFail("Item not accepted by queue")
